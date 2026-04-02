@@ -2,8 +2,8 @@
 **Authorized Offensive Security & Red Team Workflow Toolkit**
 
 > 🔒 **Scoped. Authorized. Workflow-Driven.**  
-> 🔧 Dev: `oxbv1 | oxborn3` | 🌐 `www.oxborn3.com` | 📧 `contact@oxborn3.com`  
-> 📦 Repo: `github.com/oxborn3/whisp3r`
+> 🔧 Dev: `oxbv1 | 0xb0rn3` | 🌐 `www.oxborn3.com` | 📧 `contact@oxborn3.com`  
+> 📦 Repo: `github.com/0xb0rn3/whisp3r`
 
 ---
 
@@ -38,7 +38,7 @@ Both versions are standalone Python executables with `#!/usr/bin/env python3` sh
 
 ```bash
 # 1. Clone or download both versions
-git clone https://github.com/oxborn3/whisp3r.git
+git clone https://github.com/0xb0rn3/whisp3r.git
 cd whisp3r
 
 # 2. Make both executables
@@ -209,10 +209,10 @@ Plugins inherit core scope/OPSEC settings and can extend menu options or workflo
 ---
 
 ## 🧑‍💻 Developer & Contact
-- **Aliases**: `oxbv1 | oxborn3`
+- **Aliases**: `oxbv1 | 0xb0rn3`
 - **Email**: `contact@oxborn3.com`
 - **Web**: `www.oxborn3.com`
-- **Repository**: `github.com/oxborn3/whisp3r`
+- **Repository**: `github.com/0xb0rn3/whisp3r`
 - **License**: MIT (Educational/Authorized Use Only)
 - **Contributing**: Pull requests must include scope validation tests, audit log coverage, and dry-run compatibility.
 
